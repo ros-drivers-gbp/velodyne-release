@@ -44,15 +44,17 @@
  *              PCAP dump
  */
 
-#include <unistd.h>
-#include <string>
-#include <sstream>
-#include <sys/socket.h>
 #include <arpa/inet.h>
-#include <poll.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pcap.h>
+#include <poll.h>
+#include <string>
+#include <sstream>
 #include <sys/file.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <velodyne_driver/input.h>
 #include <velodyne_driver/time_conversion.hpp>
 
@@ -114,6 +116,13 @@ namespace velodyne_driver
     my_addr.sin_port = htons(port);          // port in network byte order
     my_addr.sin_addr.s_addr = INADDR_ANY;    // automatically fill in my IP
   
+    // compatibility with Spot Core EAP, reuse port 2368
+    int val = 1;
+    if(setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) == -1) {
+        perror("socketopt");
+        return;
+    }
+
     if (bind(sockfd_, (sockaddr *)&my_addr, sizeof(sockaddr)) == -1)
       {
         perror("bind");                 // TODO: ROS_ERROR errno
@@ -180,7 +189,7 @@ namespace velodyne_driver
             if (retval == 0)            // poll() timeout?
               {
                 ROS_WARN("Velodyne poll() timeout");
-                return -1;
+                return 0;
               }
             if ((fds[0].revents & POLLERR)
                 || (fds[0].revents & POLLHUP)
@@ -234,7 +243,7 @@ namespace velodyne_driver
       pkt->stamp = rosTimeFromGpsTimestamp(&(pkt->data[1200]));
     }
 
-    return 0;
+    return 1;
   }
 
   ////////////////////////////////////////////////////////////////////////
@@ -262,6 +271,7 @@ namespace velodyne_driver
     private_nh.param("read_once", read_once_, false);
     private_nh.param("read_fast", read_fast_, false);
     private_nh.param("repeat_delay", repeat_delay_, 0.0);
+    private_nh.param("pcap_time", pcap_time_, false);
 
     if (read_once_)
       ROS_INFO("Read input file only once.");
@@ -317,9 +327,19 @@ namespace velodyne_driver
               packet_rate_.sleep();
             
             memcpy(&pkt->data[0], pkt_data+42, packet_size);
-            pkt->stamp = ros::Time::now(); // time_offset not considered here, as no synchronization required
+            if (!gps_time_) {
+              if (!pcap_time_) {
+                pkt->stamp = ros::Time::now(); // time_offset not considered here, as no synchronization required
+              } else {
+                pkt->stamp = ros::Time(header->ts.tv_sec, header->ts.tv_usec * 1000); // 
+              }
+            } else {
+              // time for each packet is a 4 byte uint located starting at offset 1200 in
+              // the data packet
+              pkt->stamp = rosTimeFromGpsTimestamp(&(pkt->data[1200]), header);
+            }
             empty_ = false;
-            return 0;                   // success
+            return 1;                   // success
           }
 
         if (empty_)                 // no data in file?
